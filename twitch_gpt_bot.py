@@ -3,7 +3,6 @@ import asyncio
 import ssl
 import requests
 import openai
-import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,7 +12,7 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWITCH_TOKEN = os.getenv("TWITCH_TOKEN")  # debe incluir 'oauth:' prefix
 CHANNEL = os.getenv("CHANNEL")
-NICK = os.getenv("NICK")  # nick del bot
+NICK = os.getenv("NICK")  # Aquí el nick del bot
 MAX_HISTORIAL = 30
 
 openai.api_key = OPENAI_API_KEY
@@ -27,12 +26,10 @@ def refrescar_token(refresh_token_actual):
         'client_id': CLIENT_ID,
         'client_secret': CLIENT_SECRET,
     }
-
     try:
         response = requests.post(url, data=params)
         response.raise_for_status()
         data = response.json()
-        
         if 'access_token' in data:
             print('[INFO] Token refrescado correctamente.')
             return data['access_token'], data.get('refresh_token', refresh_token_actual), data['expires_in']
@@ -46,11 +43,9 @@ def refrescar_token(refresh_token_actual):
 def preguntar_chatgpt_con_contexto(mensajes_historial):
     if not mensajes_historial:
         return "No hay mensajes recientes."
-
     contexto = [
-        {"role": "system", "content": "Eres un bot amigable de Twitch llamado iaTuPapi, responde de manera divertida a lo que dice la gente."},
+        {"role": "system", "content": "Eres un bot amigable de Twitch llamado tuIaPapi, responde de manera divertida a lo que dice la gente."},
     ]
-
     historial_recortado = mensajes_historial[-MAX_HISTORIAL:]
     for msg in historial_recortado:
         contexto.append({"role": "user", "content": msg})
@@ -73,17 +68,17 @@ class TwitchIRCClient:
         self.port = 6697
         self.token = token
         self.channel = f"#{channel.lower()}"
-        self.nick = nick
+        self.nick = nick.lower()
         self.reader = None
         self.writer = None
-        self.mensajes = []
-        self.menciones = []
+        self.mensajes = []    # Historial general de mensajes
+        self.menciones = []   # Cola de menciones al bot
 
     async def connect(self):
         print("[INFO] Conectando a Twitch IRC...")
         ssl_context = ssl.create_default_context()
         self.reader, self.writer = await asyncio.open_connection(self.server, self.port, ssl=ssl_context)
-        print(f"[DEBUG] Usando NICK: '{self.nick}'")
+        
         await self.send_cmd(f"PASS {self.token}")
         await self.send_cmd(f"NICK {self.nick}")
         await self.send_cmd(f"JOIN {self.channel}")
@@ -97,10 +92,6 @@ class TwitchIRCClient:
         await self.send_cmd(f"PRIVMSG {self.channel} :{message}")
 
     async def handle_messages(self):
-        pattern = re.compile(rf"@{re.escape(self.nick)}\b", re.IGNORECASE)
-        print(f"[DEBUG] Nick del bot para detección: '{self.nick}'")
-        print(f"[DEBUG] Regex usado: {pattern.pattern}")
-
         while True:
             try:
                 line = await self.reader.readline()
@@ -116,41 +107,50 @@ class TwitchIRCClient:
                     prefix, msg = decoded.split(" PRIVMSG ", 1)
                     user = prefix.split("!")[0][1:]
                     channel, message = msg.split(" :", 1)
-                    print(f"[DEBUG] Mensaje recibido de '{user}' en '{channel}': {message}")
+                    print(f"{user} en {channel}: {message}")
 
-                    if user.lower() == self.nick.lower():
-                        continue
+                    if user.lower() != self.nick.lower():
+                        self.mensajes.append(f"{user}: {message}")
 
-                    self.mensajes.append(f"{user}: {message}")
-
-                    if pattern.search(message):
-                        print(f"[INFO] Mención detectada en mensaje: {message}")
-                        mensaje_limpio = pattern.sub("", message).strip()  # Eliminar la mención
-                        self.menciones.append({"user": user, "message": mensaje_limpio})
-                    else:
-                        print("[DEBUG] No se encontró mención en este mensaje.")
+                        if f"@{self.nick}" in message.lower():
+                            print(f"[INFO] Mención detectada de {user}")
+                            self.menciones.append({"user": user, "message": message})
 
             except Exception as e:
                 print(f"[ERROR] Error leyendo mensaje IRC: {e}")
 
     async def responder_periodicamente(self):
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
             if self.menciones:
+                print(f"[DEBUG] Procesando {len(self.menciones)} menciones...")
+
                 for mencion in self.menciones:
-                    user = mencion["user"]
+                    usuario = mencion["user"]
                     mensaje = mencion["message"]
-                    print(f"[DEBUG] Generando respuesta para mención de {user}...")
-                    respuesta = preguntar_chatgpt_con_contexto([f"{user}: {mensaje}"])
-                    if respuesta and respuesta != "No hay mensajes recientes.":
+                    prompt = f"{usuario} dijo: {mensaje}"
+                    respuesta = preguntar_chatgpt_con_contexto([prompt])
+
+                    if respuesta:
+                        respuesta_dirigida = f"@{usuario} {respuesta}"
                         try:
-                            await self.send_message(f"@{user} {respuesta}")
-                            print(f"🤖 Respuesta a @{user}: {respuesta}")
+                            await self.send_message(respuesta_dirigida)
+                            await asyncio.sleep(1.5)
                         except Exception as e:
-                            print(f"[ERROR] Error enviando mensaje: {e}")
+                            print(f"[ERROR] Error enviando respuesta a {usuario}: {e}")
                 self.menciones.clear()
             else:
                 print("[DEBUG] No hay menciones nuevas.")
+
+    async def anunciar_presencia_periodicamente(self):
+        while True:
+            await asyncio.sleep(1800)  # 30 minutos = 1800 segundos
+            try:
+                mensaje = f"¡Hola! Soy {self.nick}. Si quieres que te responda algo divertido, solo mencióname con @{self.nick} en el chat."
+                await self.send_message(mensaje)
+                print(f"[INFO] Mensaje automático enviado: {mensaje}")
+            except Exception as e:
+                print(f"[ERROR] Error al enviar mensaje automático: {e}")
 
 async def main():
     client = TwitchIRCClient(TWITCH_TOKEN, CHANNEL, NICK)
@@ -159,6 +159,7 @@ async def main():
     await asyncio.gather(
         client.handle_messages(),
         client.responder_periodicamente(),
+        client.anunciar_presencia_periodicamente(),  # Nueva tarea añadida aquí
     )
 
 if __name__ == "__main__":
